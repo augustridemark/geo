@@ -8,7 +8,8 @@ both in SWEREF 99 TM (EPSG:3006). We reproject to WGS84 (EPSG:4326) with
 Lantmäteriet's own Gauss-Krüger formula.
 
 Input is either a single beteckning string or a CSV file with a header row and
-the beteckningar in the first column (extra columns are ignored). The block/unit
+the beteckningar in the first column (extra columns are ignored; the column
+delimiter -- comma, semicolon or tab -- is detected automatically). The block/unit
 separator may be a colon ("emmaboda emmabo 1:116") or a space ("emmaboda emmabo
 1 116"); both are accepted with no extra flag.
 
@@ -29,6 +30,9 @@ Options:
     --geojson         also write a GeoJSON FeatureCollection (boundary polygons)
     --gpkg            also write an OGC GeoPackage (.gpkg) MULTIPOLYGON layer, WGS84
     --delay SECONDS   pause between beteckningar (default 0.15; use 0 for none)
+    --debug           log the exact search text sent and the hits returned per
+                      row (and the detected column delimiter) -- use this to see
+                      why rows come back "not found"
 
 CSV and GeoJSON use only the standard library; --gpkg requires geopandas
 (pip install geopandas). Requests retry automatically on HTTP 429 / transient
@@ -125,6 +129,44 @@ def _get_json(url, params, max_retries=MAX_RETRIES):
             time.sleep(wait)
 
 
+def _detect_delimiter(lines):
+    """Guess the CSV column delimiter: ';', tab, or ','.
+
+    Excel on European/Swedish Windows saves CSVs delimited with ';', which the
+    default ',' reader would swallow into a single column -- making the whole
+    line the search text and every lookup fail. Beteckningar contain none of
+    these characters, so we pick whichever candidate appears the same non-zero
+    number of times in every data row, falling back to ',' (e.g. a
+    single-column file has no delimiter at all).
+    """
+    data = [ln for ln in lines[1:] if ln.strip()][:20]  # sample data rows
+    if not data:
+        data = [ln for ln in lines if ln.strip()][:20]
+    for delim in (";", "\t", ","):
+        counts = [ln.count(delim) for ln in data]
+        if counts and counts[0] > 0 and all(c == counts[0] for c in counts):
+            return delim
+    return ","
+
+
+def _read_text(path):
+    """Read a text file, tolerating the encodings Excel produces on Windows.
+
+    Tries UTF-8 (with or without a BOM) first, then Windows-1252 (a.k.a. ANSI /
+    CP1252) -- the default Excel uses on a Swedish Windows PC -- so a CSV with
+    å/ä/ö saved straight from Excel decodes instead of raising. UTF-8 is tried
+    first, so a genuine UTF-8 file is never mis-read as CP1252.
+    """
+    with open(path, "rb") as fh:
+        data = fh.read()
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("latin-1")  # 1 byte -> 1 char, never raises
+
+
 def _norm(s):
     return " ".join(s.lower().split())
 
@@ -180,18 +222,26 @@ def fetch_polygons(objektidentitet):
     return multipoly
 
 
-def geocode(beteckning, want_polygon=False):
+def geocode(beteckning, want_polygon=False, debug=False):
     """Return a dict with matched name, lat, lon, status (and polygon if asked)."""
     result = {"input": beteckning, "matched": "", "lat": "", "lon": "",
               "status": "", "polygon": []}
     query = normalize_beteckning(beteckning)  # accept "1 116" as "1:116"
+    if debug:
+        print(f"    -> searching for {query!r}", file=sys.stderr, flush=True)
     try:
         data = _get_json(SEARCH_URL, {"searchtext": query})
     except Exception as e:  # network / HTTP / parse error
         result["status"] = f"error: {e}"
+        if debug:
+            print(f"    !! request failed: {e}", file=sys.stderr, flush=True)
         return result
 
     results = data.get("sokresultat") or []
+    if debug:
+        print(f"    <- {len(results)} hit(s) returned", file=sys.stderr, flush=True)
+        for hit in results[:5]:
+            print(f"         {hit.get('headertext', '')!r}", file=sys.stderr, flush=True)
     if not results:
         result["status"] = "not found"
         return result
@@ -261,7 +311,7 @@ def write_geopackage(rows, path, layer="fastigheter"):
 
 
 def main(argv):
-    want_geojson = want_gpkg = False
+    want_geojson = want_gpkg = debug = False
     delay = DEFAULT_DELAY
     while argv and argv[0].startswith("-"):
         opt = argv.pop(0)
@@ -269,6 +319,8 @@ def main(argv):
             want_geojson = True
         elif opt == "--gpkg":
             want_gpkg = True
+        elif opt in ("--debug", "-d"):
+            debug = True
         elif opt == "--delay":
             try:
                 delay = float(argv.pop(0))
@@ -301,10 +353,18 @@ def main(argv):
         inpath = argv[0]
         base = os.path.splitext(os.path.basename(inpath))[0]
         outdir = os.path.dirname(os.path.abspath(inpath))
-        with open(inpath, encoding="utf-8-sig", newline="") as fh:
-            reader = csv.reader(fh)
-            next(reader, None)  # skip header row
-            queries = [row[0].strip() for row in reader if row and row[0].strip()]
+        # splitlines() handles \n, \r\n and \r; _read_text() copes with UTF-8
+        # or Windows-1252 (Excel's default), so Swedish characters don't fail.
+        lines = _read_text(inpath).splitlines()
+        delimiter = _detect_delimiter(lines)  # ',' or ';' (Excel/EU) or tab
+        reader = csv.reader(lines, delimiter=delimiter)
+        next(reader, None)  # skip header row
+        queries = [row[0].strip() for row in reader if row and row[0].strip()]
+        if debug:
+            print(f"    input: {len(queries)} data row(s), delimiter="
+                  f"{delimiter!r}; using the first column", file=sys.stderr, flush=True)
+            for q in queries[:5]:
+                print(f"         parsed: {q!r}", file=sys.stderr, flush=True)
     else:
         queries = [" ".join(argv)]
         base, outdir = "fastighet", os.getcwd()
@@ -314,6 +374,14 @@ def main(argv):
 
     want_polygon = want_geojson or want_gpkg
     rows = []
+    total = len(queries)
+    if total == 0:
+        print("No beteckningar found in the input -- is the first column empty, "
+              "or does the file have only a header row? Run with --debug to see "
+              "how the file was parsed.", file=sys.stderr)
+        return 1
+    # Progress and warnings go to stderr so a summary on stdout stays clean.
+    print(f"Looking up {total} beteckning(ar)...", file=sys.stderr, flush=True)
     # utf-8-sig so Swedish characters display correctly in Excel.
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as cf:
         writer = csv.DictWriter(
@@ -321,11 +389,20 @@ def main(argv):
             extrasaction="ignore")
         writer.writeheader()
         for i, q in enumerate(queries):
-            r = geocode(q, want_polygon=want_polygon)
+            r = geocode(q, want_polygon=want_polygon, debug=debug)
             rows.append(r)
             writer.writerow(r)
             cf.flush()  # keep partial results on disk during long runs
-            if delay > 0 and i + 1 < len(queries):
+
+            # Live progress: one line per row, flagging anything not an exact
+            # match (not found, error, or approx) so problems are easy to spot.
+            status = r["status"]
+            matched = f"  ->  {r['matched']}" if r["matched"] else ""
+            flag = "" if status.startswith("ok") else "   <-- CHECK"
+            print(f"[{i + 1}/{total}] {q}{matched}  [{status}]{flag}",
+                  file=sys.stderr, flush=True)
+
+            if delay > 0 and i + 1 < total:
                 time.sleep(delay)  # be polite to the service
 
     outputs = [csv_path]
