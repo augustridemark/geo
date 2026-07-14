@@ -1,0 +1,13 @@
+python .\geocode_fastighet.py fastigheter-example.csv
+Traceback (most recent call last):
+  File "C:\Users\p901dtr\Downloads\geo-main\geo-main\geocode-fastighet-windows\geocode_fastighet.py", line 358, in <module>
+    sys.exit(main(sys.argv[1:]))
+             ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\p901dtr\Downloads\geo-main\geo-main\geocode-fastighet-windows\geocode_fastighet.py", line 306, in main
+    next(reader, None)  # skip header row
+    ^^^^^^^^^^^^^^^^^^
+  File "<frozen codecs>", line 322, in decode
+  File "C:\Program Files\Python312\Lib\encodings\utf_8_sig.py", line 69, in _buffer_decode
+    return codecs.utf_8_decode(input, errors, final)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xc5 in position 72: invalid continuation byte
